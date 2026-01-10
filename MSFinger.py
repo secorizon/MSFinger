@@ -16,6 +16,7 @@
 
 import re
 import sys
+import ssl
 import struct
 import socket
 import argparse
@@ -24,6 +25,73 @@ import ipaddress
 import warnings
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import quote
+
+# Import msldap for LDAPS CBT detection
+try:
+    import asyncio
+    from msldap.commons.factory import LDAPConnectionFactory
+    from msldap.connection import MSLDAPClientConnection
+    MSLDAP_AVAILABLE = True
+except ImportError:
+    MSLDAP_AVAILABLE = False
+    asyncio = None
+    LDAPConnectionFactory = None
+    MSLDAPClientConnection = None
+    print("Warning: msldap not available. LDAPS CBT detection will be disabled.")
+
+
+class ADClient:
+    """ADClient class for LDAPS CBT detection using msldap"""
+    def __init__(self, domain, url):
+        self.domain = domain
+        self.base_dn = ",".join([f"DC={part}" for part in domain.split('.')])
+        self.url = url
+        self.msldap_conn = None
+        self.msldap_client = None
+        self.msldap_client_conn = None
+        self.msldap_client_conn_err = None
+
+    async def connect(self, cb_data=None):
+        """Connect to LDAP server and test channel binding if cb_data is provided"""
+        self.msldap_conn = LDAPConnectionFactory.from_url(self.url).get_connection()
+        await self.msldap_conn.connect()
+        await self.msldap_conn.bind()
+
+        self.msldap_client = LDAPConnectionFactory.from_url(self.url).get_client()
+
+        if cb_data:
+            self.msldap_client_conn = MSLDAPClientConnection(self.msldap_client.target, self.msldap_client.creds)
+            await self.msldap_client_conn.connect()
+            self.msldap_client_conn.cb_data = cb_data
+            _, self.msldap_client_conn_err = await self.msldap_client_conn.bind()
+
+        await self.msldap_client.connect()
+        return self.msldap_client
+
+    async def disconnect(self):
+        """Disconnect all connections and clean up background tasks"""
+        if self.msldap_client_conn:
+            try:
+                await asyncio.wait_for(self.msldap_client_conn.disconnect(), timeout=2.0)
+            except (asyncio.TimeoutError, Exception):
+                try:
+                    if hasattr(self.msldap_client_conn, 'close'):
+                        self.msldap_client_conn.close()
+                except Exception:
+                    pass
+            self.msldap_client_conn = None
+        
+        for conn in [self.msldap_client, self.msldap_conn]:
+            if conn:
+                try:
+                    await asyncio.wait_for(conn.disconnect(), timeout=2.0)
+                except (asyncio.TimeoutError, Exception):
+                    pass
+        
+        self.msldap_client = None
+        self.msldap_conn = None
+        await asyncio.sleep(0.1)
 
 # Suppress SSL deprecation warnings
 warnings.filterwarnings('ignore', category=DeprecationWarning)
@@ -603,129 +671,184 @@ def detect_smb2(host, timeout):
 # LDAP/LDAPS Detection
 # ============================================================================
 
-def build_ldap_bind_request():
-    """Build LDAP bind request to test for signing"""
-    # Simple LDAP Bind Request (anonymous)
-    # BER encoding of LDAP BindRequest
-    bind_request = (
-        b"\x30"  # SEQUENCE
-        b"\x0c"  # Length
-        b"\x02\x01\x01"  # messageID: 1
-        b"\x60"  # BindRequest
-        b"\x07"  # Length
-        b"\x02\x01\x03"  # version: 3
-        b"\x04\x00"      # name: empty (anonymous)
-        b"\x80\x00"      # authentication: simple, empty
-    )
-    return bind_request
+def detect_ldaps_cbt(host, username, password, timeout=5):
+    """Detect LDAPS Channel Binding Token (CBT) requirement using msldap"""
+    
+    if not MSLDAP_AVAILABLE:
+        return "unknown"
+    
+    if not username or not password:
+        return "unknown"
+    
+    username_str = username.decode('utf-8') if isinstance(username, bytes) else username
+    password_str = password.decode('utf-8') if isinstance(password, bytes) else password
+    
+    # Extract domain from username
+    domain = None
+    if '\\' in username_str:
+        # Format: DOMAIN\username
+        domain, _ = username_str.split('\\', 1)
+    elif '@' in username_str:
+        # Format: username@domain.com
+        domain = username_str.split('@', 1)[1]
+    else:
+        # Can't determine domain
+        return "unknown"
+    
+    # Build LDAPS URL with NTLM authentication
+    # Format: ldaps+ntlm-password://username:password@host:636
+    encoded_username = quote(username_str, safe='')
+    encoded_password = quote(password_str, safe='')
+    url = f"ldaps+ntlm-password://{encoded_username}:{encoded_password}@{host}:636"
+    
+    async def _detect_cbt():
+        """Async function to detect CBT using msldap"""
+        ad_client = None
+        timeout_seconds = max(timeout, 5)  # Minimum 5 seconds timeout
+        
+        try:
+            ad_client = ADClient(domain=domain, url=url)
+            try:
+                # Connect with zero CBT data to test if server requires it
+                # Use timeout to prevent hanging
+                await asyncio.wait_for(
+                    ad_client.connect(cb_data=b'\x00' * 73),
+                    timeout=timeout_seconds
+                )
+                
+                # Check for channel binding error (80090346)
+                err = str(ad_client.msldap_client_conn_err) if ad_client.msldap_client_conn_err else None
+                
+                if err and 'data 80090346' in err:
+                    return "required"
+                return "not_required"
+            except asyncio.TimeoutError:
+                return "unknown"
+            except Exception as e:
+                err_str = str(e)
+                if 'Connect to the LDAP server before binding.' in err_str:
+                    return "not_required"
+                if '80090346' in err_str or 'data 80090346' in err_str:
+                    return "required"
+                return "unknown"
+        except Exception as e:
+            err_str = str(e)
+            if '80090346' in err_str or 'data 80090346' in err_str:
+                return "required"
+            return "unknown"
+        finally:
+            if ad_client:
+                try:
+                    await asyncio.wait_for(ad_client.disconnect(), timeout=3.0)
+                except (asyncio.TimeoutError, Exception):
+                    try:
+                        if ad_client.msldap_client_conn and hasattr(ad_client.msldap_client_conn, 'close'):
+                            ad_client.msldap_client_conn.close()
+                    except Exception:
+                        pass
+                await asyncio.sleep(0.2)
+    
+    # Run async function
+    try:
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+        
+        if loop.is_running():
+            try:
+                import nest_asyncio
+                nest_asyncio.apply()
+                return loop.run_until_complete(_detect_cbt())
+            except (ImportError, RuntimeError):
+                return "unknown"
+        else:
+            result = loop.run_until_complete(_detect_cbt())
+            try:
+                loop.run_until_complete(asyncio.sleep(0.1))
+            except Exception:
+                pass
+            return result
+    except Exception:
+        try:
+            return asyncio.run(_detect_cbt())
+        except Exception:
+            return "unknown"
 
-def detect_ldap_signing(host, port, timeout, use_ssl=False):
-    """Detect if LDAP/LDAPS signing is required and channel binding status"""
-    s = None
+
+def build_ldap_simple_bind_request(username, password):
+    """Build LDAP simple authenticated bind request"""
+    if isinstance(username, str):
+        username = username.encode('utf-8')
+    if isinstance(password, str):
+        password = password.encode('utf-8')
+    
+    msgid = b"\x02\x01\x01"
+    version = b"\x02\x01\x03"
+    name = b"\x04" + bytes([len(username)]) + username
+    auth = b"\x80" + bytes([len(password)]) + password
+    bind_req = b"\x60" + bytes([len(version + name + auth)]) + version + name + auth
+    return b"\x30" + bytes([len(msgid + bind_req)]) + msgid + bind_req
+
+
+def detect_ldap_signing(host, port, timeout=5, use_ssl=False, username=None, password=None):
+    """Detect LDAP/LDAPS signing and channel binding requirements"""
+    if not username or not password:
+        return {"supported": False, "ssl": use_ssl, "signing": "unknown",
+                "ldaps_ntlm_cbt": "unknown"}
+    
+    result = {"supported": False, "ssl": use_ssl, "signing": "unknown",
+              "ldaps_ntlm_cbt": "unknown"}
+     
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(timeout)
         s.connect((host, port))
-        
-        # For LDAPS, wrap in SSL
+
         if use_ssl:
-            import ssl
-            
-            # Create SSL context - use PROTOCOL_TLS for maximum compatibility
-            try:
-                context = ssl.SSLContext(ssl.PROTOCOL_TLS)
-            except AttributeError:
-                # Fallback for very old Python versions
-                context = ssl.SSLContext(ssl.PROTOCOL_SSLv23)
-            
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
             context.check_hostname = False
             context.verify_mode = ssl.CERT_NONE
-            
-            # Disable SSLv2 and SSLv3 but allow TLS 1.0+
-            context.options |= ssl.OP_NO_SSLv2
-            context.options |= ssl.OP_NO_SSLv3
-            
-            # Set permissive cipher list
             try:
                 context.set_ciphers('DEFAULT:@SECLEVEL=0')
-            except:
-                context.set_ciphers('DEFAULT')
-            
-            # Wrap the socket - this will send Client Hello
-            try:
-                s = context.wrap_socket(s, do_handshake_on_connect=True)
-            except ssl.SSLError as e:
-                # SSL handshake failed - server closed connection or doesn't support SSL
-                if s:
-                    try:
-                        s.close()
-                    except:
-                        pass
-                return {"supported": False, "ssl": True, "error": "SSL handshake failed"}
-            except OSError as e:
-                # Connection reset or other network error
-                if s:
-                    try:
-                        s.close()
-                    except:
-                        pass
-                return {"supported": False, "ssl": True, "error": f"Connection error: {e.errno}"}
-            except Exception as e:
-                if s:
-                    try:
-                        s.close()
-                    except:
-                        pass
-                return {"supported": False, "ssl": True, "error": str(e)}
-        
-        # Send LDAP bind without signing
-        s.send(build_ldap_bind_request())
-        data = s.recv(4096)
-        
-        if len(data) < 10:
-            if s:
-                s.close()
-            return None
-        
-        # Parse LDAP response
-        result_code_offset = data.find(b'\x0a\x01')
-        
-        result_info = {"supported": True, "ssl": use_ssl}
-        
-        if result_code_offset > 0 and result_code_offset + 2 < len(data):
-            result_code = data[result_code_offset + 2]
-            
-            if result_code == 0:
-                result_info["signing"] = "not_required"
-                if use_ssl:
-                    result_info["channel_binding"] = "not_required"
-            elif result_code == 8:
-                result_info["signing"] = "required"
-                if use_ssl:
-                    result_info["channel_binding"] = "unknown"
-            elif result_code == 13:
-                result_info["signing"] = "unknown"
-                if use_ssl:
-                    result_info["channel_binding"] = "required"
-            else:
-                result_info["signing"] = "unknown"
-                if use_ssl:
-                    result_info["channel_binding"] = "unknown"
-        else:
-            result_info["signing"] = "unknown"
-            if use_ssl:
-                result_info["channel_binding"] = "unknown"
-        
-        if s:
-            s.close()
-        return result_info
-    except Exception as e:
-        if s:
-            try:
-                s.close()
-            except:
+            except Exception:
                 pass
-        return None
+            s = context.wrap_socket(s, do_handshake_on_connect=True)
+
+        s.send(build_ldap_simple_bind_request(username, password))
+        data = s.recv(4096)
+        s.close()
+
+        if not data or len(data) < 10:
+            return result
+
+        idx = data.find(b"\x0a\x01")
+        if idx == -1 or idx + 2 >= len(data):
+            return result
+
+        code = data[idx + 2]
+
+        if not use_ssl:
+            if code == 0:
+                result["signing"] = "not_required"
+            elif code == 8:
+                result["signing"] = "required"
+            elif code == 49:
+                result["signing"] = "not_required"
+        else:
+            result["signing"] = "required"
+            # Try to detect LDAP CBT using msldap
+            if MSLDAP_AVAILABLE:
+                user_str = username.decode('utf-8') if isinstance(username, bytes) else username
+                pwd_str = password.decode('utf-8') if isinstance(password, bytes) else password
+                result["ldaps_ntlm_cbt"] = detect_ldaps_cbt(host, user_str, pwd_str, timeout)
+
+        result["supported"] = True
+        return result
+
+    except Exception:
+        return result
 
 # ============================================================================
 # Service Detection
@@ -746,7 +869,7 @@ def check_port_open(host, port, timeout):
 # Main Fingerprinting Function
 # ============================================================================
 
-def fingerprint_host(host, timeout=DEFAULT_TIMEOUT):
+def fingerprint_host(host, timeout=DEFAULT_TIMEOUT, username=None, password=None):
     """Perform comprehensive host fingerprinting"""
     result = {
         "host": host,
@@ -758,34 +881,27 @@ def fingerprint_host(host, timeout=DEFAULT_TIMEOUT):
         "ldaps": None,
     }
     
-    # SMB2/3 Detection (try first as it's more common)
     smb2_info = detect_smb2(host, timeout)
     if smb2_info:
         result["smb2"] = smb2_info
     
-    # SMB1 Detection
     smb1_info = detect_smb1(host, timeout)
     if smb1_info:
         result["smb1"] = smb1_info
     
-    # RDP Detection (port 3389)
     result["rdp"] = check_port_open(host, 3389, timeout)
-    
-    # MSSQL Detection (port 1433)
     result["mssql"] = check_port_open(host, 1433, timeout)
     
-    # LDAP Detection (port 389)
-    ldap_info = detect_ldap_signing(host, 389, timeout, use_ssl=False)
-    if ldap_info:
-        result["ldap"] = ldap_info
-    
-    # LDAPS Detection (port 636) - use much longer timeout for SSL
-    # Only try if port is open
-    if check_port_open(host, 636, timeout):
-        ldaps_timeout = max(timeout * 3, 2.0)  # At least 2 seconds for SSL
-        ldaps_info = detect_ldap_signing(host, 636, ldaps_timeout, use_ssl=True)
-        if ldaps_info:
-            result["ldaps"] = ldaps_info
+    if username and password:
+        ldap_info = detect_ldap_signing(host, 389, timeout, use_ssl=False, username=username, password=password)
+        if ldap_info:
+            result["ldap"] = ldap_info
+        
+        if check_port_open(host, 636, timeout):
+            ldaps_timeout = max(timeout * 3, 2.0)
+            ldaps_info = detect_ldap_signing(host, 636, ldaps_timeout, use_ssl=True, username=username, password=password)
+            if ldaps_info:
+                result["ldaps"] = ldaps_info
     
     return result
 
@@ -868,29 +984,28 @@ def format_result(result):
             ldaps_str = color_text(f"LDAPS (port open, {error})", Colors.YELLOW)
             services.append(ldaps_str)
         else:
-            ldaps_signing = ldaps_info.get("signing", "unknown")
-            ldaps_channel_binding = ldaps_info.get("channel_binding", "unknown")
+            ldaps_ntlm_cbt = ldaps_info.get("ldaps_ntlm_cbt", "unknown")
             
-            # Build LDAPS string with both signing and channel binding
+            # Build LDAPS string
             ldaps_parts = []
             
-            # Signing status
-            if ldaps_signing == "required":
-                ldaps_parts.append(color_text(f"signing: {ldaps_signing}", Colors.GREEN))
-            elif ldaps_signing == "not_required":
-                ldaps_parts.append(color_text(f"signing: {ldaps_signing}", Colors.RED))
+            # LDAP CBT status
+            if ldaps_ntlm_cbt == "required":
+                ldaps_parts.append(color_text(f"CBT: {ldaps_ntlm_cbt}", Colors.GREEN))
+            elif ldaps_ntlm_cbt == "not_required":
+                ldaps_parts.append(color_text(f"CBT: {ldaps_ntlm_cbt}", Colors.RED))
+            elif ldaps_ntlm_cbt == "unknown":
+                if not MSLDAP_AVAILABLE:
+                    ldaps_parts.append(color_text("CBT: unknown (msldap not installed)", Colors.YELLOW))
+                else:
+                    ldaps_parts.append("CBT: unknown")
+            elif ldaps_ntlm_cbt:
+                ldaps_parts.append(f"CBT: {ldaps_ntlm_cbt}")
+            
+            if ldaps_parts:
+                ldaps_str = f"LDAPS ({', '.join(ldaps_parts)})"
             else:
-                ldaps_parts.append(f"signing: {ldaps_signing}")
-            
-            # Channel binding status
-            if ldaps_channel_binding == "required":
-                ldaps_parts.append(color_text(f"channel binding: {ldaps_channel_binding}", Colors.GREEN))
-            elif ldaps_channel_binding == "not_required":
-                ldaps_parts.append(color_text(f"channel binding: {ldaps_channel_binding}", Colors.RED))
-            elif ldaps_channel_binding != "unknown":
-                ldaps_parts.append(f"channel binding: {ldaps_channel_binding}")
-            
-            ldaps_str = f"LDAPS ({', '.join(ldaps_parts)})"
+                ldaps_str = "LDAPS"
             services.append(ldaps_str)
     
     if services:
@@ -979,6 +1094,10 @@ For detailed documentation, see the README or run with --help
                         help=f'SQLite database file for results (default: {DEFAULT_DB})')
     parser.add_argument('--no-color', action='store_true',
                         help='Disable colored output')
+    parser.add_argument('-u', '--username', dest='username',
+                        help='LDAP/LDAPS username (e.g., Administrator@domain.com or DOMAIN\\user)')
+    parser.add_argument('-p', '--password', dest='password',
+                        help='LDAP/LDAPS password')
     
     args = parser.parse_args()
     
@@ -1010,7 +1129,7 @@ For detailed documentation, see the README or run with --help
     
     # Process targets with thread pool
     with ThreadPoolExecutor(max_workers=args.workers) as executor:
-        futures = {executor.submit(fingerprint_host, target, args.timeout): target 
+        futures = {executor.submit(fingerprint_host, target, args.timeout, args.username, args.password): target 
                    for target in targets}
         
         for future in as_completed(futures):
